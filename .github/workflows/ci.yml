@@ -1,0 +1,141 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: test (node ${{ matrix.node }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['18', '20', '22', '24']
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      # `node --test` only accepts glob patterns from Node 21, so the suite
+      # relies on built-in discovery. That treats every file under test/ as a
+      # test file, which is why shared helpers live in test-utils/.
+      - run: node --test
+
+  zero-deps:
+    name: zero runtime dependencies
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: assert no runtime dependencies
+        run: |
+          count=$(node -p "Object.keys(require('./package.json').dependencies || {}).length")
+          if [ "$count" != "0" ]; then
+            echo "expected zero runtime dependencies, found $count"
+            exit 1
+          fi
+      - name: assert nothing is imported from node_modules
+        run: node scripts/check-imports.mjs
+
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: node --test --experimental-test-coverage
+
+  startup-contract:
+    name: startup contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: exits 2 with no configuration
+        run: |
+          set +e
+          out=$(node bin/redpanda-console-mcp.mjs 2>&1)
+          code=$?
+          set -e
+          [ "$code" = "2" ] || { echo "expected exit 2, got $code"; exit 1; }
+          echo "$out" | grep -q 'CONSOLE_BASE_URL is not set' || { echo "unhelpful message: $out"; exit 1; }
+
+      - name: exits 2 on a non-http base url
+        run: |
+          set +e
+          out=$(CONSOLE_BASE_URL='ftp://x' node bin/redpanda-console-mcp.mjs 2>&1)
+          code=$?
+          set -e
+          [ "$code" = "2" ] || { echo "expected exit 2, got $code"; exit 1; }
+          echo "$out" | grep -q 'must start with http' || { echo "unhelpful message: $out"; exit 1; }
+
+      - name: reports its version
+        run: |
+          v=$(node bin/redpanda-console-mcp.mjs --version)
+          echo "$v" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$' || { echo "bad version: $v"; exit 1; }
+
+      - name: lists seven tools over stdio
+        run: |
+          out=$(echo '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' \
+            | CONSOLE_BASE_URL=https://console.invalid node bin/redpanda-console-mcp.mjs)
+          echo "$out"
+          count=$(echo "$out" | node -e "
+            let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{
+              const t=JSON.parse(s.trim().split('\n')[0]).result.tools;
+              console.log(t.length);
+            });")
+          [ "$count" = "7" ] || { echo "expected 7 tools, got $count"; exit 1; }
+
+      - name: an upstream failure is a tool error, not a crash
+        run: |
+          out=$(echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"cluster_info","arguments":{}}}' \
+            | CONSOLE_BASE_URL=https://console.invalid node bin/redpanda-console-mcp.mjs)
+          echo "$out" | grep -q '"isError":true' || { echo "expected a tool error: $out"; exit 1; }
+
+  package:
+    name: package contents
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: pack
+        run: npm pack --json > pack.json
+
+      - name: assert tests and dotfiles are excluded
+        run: |
+          files=$(node -p "require('./pack.json')[0].files.map(f=>f.path).join('\n')")
+          echo "$files"
+          echo "$files" | grep -q '^package.json$' || { echo "missing package.json"; exit 1; }
+          echo "$files" | grep -q '^README.md$'    || { echo "missing README"; exit 1; }
+          echo "$files" | grep -q '^LICENSE$'      || { echo "missing LICENSE"; exit 1; }
+          echo "$files" | grep -q 'bin/redpanda-console-mcp.mjs' || { echo "missing bin"; exit 1; }
+          if echo "$files" | grep -qE '^(test|test-utils)/'; then echo "tests must not ship"; exit 1; fi
+          if echo "$files" | grep -q '.env'; then echo ".env must not ship"; exit 1; fi
+
+      - name: the installed binary runs
+        run: |
+          tarball=$(node -p "require('./pack.json')[0].filename")
+          mkdir -p /tmp/consumer && cd /tmp/consumer
+          npm init -y >/dev/null
+          npm install "$GITHUB_WORKSPACE/$tarball" >/dev/null
+          set +e
+          out=$(./node_modules/.bin/redpanda-console-mcp 2>&1)
+          code=$?
+          set -e
+          [ "$code" = "2" ] || { echo "expected exit 2 unconfigured, got $code"; exit 1; }
+          echo "$out" | grep -q 'CONSOLE_BASE_URL' || { echo "unhelpful: $out"; exit 1; }

@@ -1,0 +1,54 @@
+{
+  "name": "redpanda-console-mcp",
+  "version": "1.0.0",
+  "description": "MCP server for retrieving and searching Kafka messages through Redpanda Console",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "redpanda",
+    "kafka",
+    "connect-rpc",
+    "llm",
+    "claude"
+  ],
+  "homepage": "https://github.com/KietDev-JS/redpanda-console-mcp#readme",
+  "bugs": "https://github.com/KietDev-JS/redpanda-console-mcp/issues",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/KietDev-JS/redpanda-console-mcp.git"
+  },
+  "license": "MIT",
+  "author": "KietDev-JS",
+  "type": "module",
+  "engines": {
+    "node": ">=18.17"
+  },
+  "bin": {
+    "redpanda-console-mcp": "bin/redpanda-console-mcp.mjs"
+  },
+  "exports": {
+    ".": "./src/server.mjs",
+    "./config": "./src/config.mjs",
+    "./console": "./src/console.mjs",
+    "./service": "./src/service.mjs",
+    "./models": "./src/models.mjs",
+    "./filters": "./src/filters.mjs"
+  },
+  "files": [
+    "bin/",
+    "src/",
+    "docs/",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test",
+    "test:coverage": "node --test --experimental-test-coverage",
+    "check:imports": "node scripts/check-imports.mjs",
+    "start": "node bin/redpanda-console-mcp.mjs"
+  },
+  "dependencies": {},
+  "publishConfig": {
+    "access": "public"
+  }
+}
