@@ -31,6 +31,12 @@ interpreter, so only matching messages cross the network.
 | `fetch_by_time` | Messages from the first offset at or after a timestamp |
 | `search_messages` | Messages whose key or value contains a substring |
 
+All seven are annotated `readOnlyHint: true`, `destructiveHint: false`.
+Arguments are checked on the server side too, because clients don't have to
+validate them. A misspelled argument such as `partition` (instead of
+`partition_id`) gets an error naming the expected arguments. It is not dropped
+silently, where it would quietly read every partition.
+
 ## Install
 
 ```bash
@@ -93,6 +99,11 @@ up a client, plus troubleshooting.
 - Search text is capped at 4096 characters.
 - A single tool result is capped at ~200 KB. Oversized results shed whole
   messages and report the truncation rather than emitting broken JSON.
+- If the stream times out or drops **after** some messages have arrived, those
+  messages are returned as `{ "messages": [...], "incomplete": { returned,
+  requested, reason } }`. They are not thrown away. This is the normal result
+  of a live tail (`start_offset: -3`) on a quiet topic. A timeout before any
+  message arrives is still an error.
 
 ## Notes on behaviour
 
@@ -125,7 +136,7 @@ process and prints a warning. Use it only against a host you control.
 ## Development
 
 ```bash
-npm test                 # 212 tests, no network access
+npm test                 # 229 tests, no network access
 npm run test:coverage
 ```
 

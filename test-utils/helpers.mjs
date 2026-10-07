@@ -62,26 +62,42 @@ export function chunked(bytes, size) {
   return chunks;
 }
 
-/** A minimal ReadableStream-like object over an array of chunks. */
-function bodyFrom(chunks) {
+/**
+ * A minimal ReadableStream-like object over an array of chunks.
+ *
+ * `failWith` is thrown once the chunks run out, to simulate a timeout or a
+ * reset mid-stream. `state` records whether the reader was cancelled.
+ */
+function bodyFrom(chunks, { failWith, state = {} } = {}) {
   let i = 0;
-  let released = false;
+  state.released = false;
+  state.cancelled = false;
   return {
     getReader() {
       return {
         async read() {
-          if (i >= chunks.length) return { done: true, value: undefined };
+          if (i >= chunks.length) {
+            if (failWith) throw failWith;
+            return { done: true, value: undefined };
+          }
           return { done: false, value: chunks[i++] };
         },
-        releaseLock() {
-          released = true;
+        async cancel() {
+          state.cancelled = true;
         },
-        get released() {
-          return released;
+        releaseLock() {
+          state.released = true;
         },
       };
     },
   };
+}
+
+/** A DOMException-shaped timeout, as thrown by AbortSignal.timeout(). */
+export function timeoutError() {
+  const e = new Error('The operation was aborted due to timeout');
+  e.name = 'TimeoutError';
+  return e;
 }
 
 /**
@@ -111,8 +127,11 @@ export function makeClient(responder, env = TEST_ENV) {
       ok: status >= 200 && status < 300,
       status,
       headers: { get: (k) => (r.headers || {})[String(k).toLowerCase()] ?? null },
-      text: async () => (r.chunks ? Buffer.concat(r.chunks.map(Buffer.from)).toString() : text),
-      body: r.chunks ? bodyFrom(r.chunks) : undefined,
+      text: async () => {
+        if (r.textError) throw r.textError;
+        return r.chunks ? Buffer.concat(r.chunks.map(Buffer.from)).toString() : text;
+      },
+      body: r.chunks ? bodyFrom(r.chunks, { failWith: r.failWith, state: r.state }) : undefined,
     };
   };
 

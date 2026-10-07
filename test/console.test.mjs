@@ -6,6 +6,7 @@ import {
   ConsoleHTTPError,
   ConsoleProtocolError,
   ConsoleRPCError,
+  ConsoleStreamInterrupted,
   encodeEnvelope,
   iterEnvelopes,
 } from '../src/console.mjs';
@@ -19,6 +20,7 @@ import {
   chunked,
   envelope,
   sentEnvelope,
+  timeoutError,
   TEST_ENV,
 } from '../test-utils/helpers.mjs';
 
@@ -205,6 +207,27 @@ describe('ConsoleClient REST', () => {
     await assert.rejects(client.getJson('/v1/topics'), /timed out after 60000ms/);
   });
 
+  test('a timeout while reading the body is a ConsoleError, not an unexpected error', async () => {
+    const { client } = makeClient(reply({ textError: timeoutError() }));
+    await assert.rejects(client.getJson('/v1/topics'), (e) => {
+      assert.ok(e instanceof ConsoleStreamInterrupted);
+      assert.ok(e instanceof ConsoleError);
+      assert.equal(e.timeout, true);
+      assert.match(e.message, /timed out after 60000ms/);
+      return true;
+    });
+  });
+
+  test('a reset while reading the body is a ConsoleError', async () => {
+    const { client } = makeClient(reply({ textError: new TypeError('terminated') }));
+    await assert.rejects(client.unaryRpc('/svc/M'), (e) => {
+      assert.ok(e instanceof ConsoleStreamInterrupted);
+      assert.equal(e.timeout, false);
+      assert.match(e.message, /interrupted while reading the response: terminated/);
+      return true;
+    });
+  });
+
   test('passes an abort signal so a hung server cannot stall forever', async () => {
     const { client, calls } = makeClient({});
     await client.getJson('/v1/topics');
@@ -343,6 +366,37 @@ describe('ConsoleClient streaming RPC', () => {
     assert.deepEqual(first.value, { data: { offset: '1' } });
     // Abandoning the generator must not throw.
     await gen.return();
+  });
+
+  test('cancels the body when the caller stops early, freeing the connection', async () => {
+    const state = {};
+    const bytes = concat(dataFrame({ offset: '1' }), dataFrame({ offset: '2' }), endFrame());
+    const { client } = makeClient(reply({ chunks: chunked(bytes, 4), state }));
+    const gen = client.streamRpc('/svc/List', {});
+    await gen.next();
+    await gen.return();
+    assert.equal(state.cancelled, true);
+    assert.equal(state.released, true);
+  });
+
+  test('does not cancel a body that was read to the end', async () => {
+    const state = {};
+    const { client } = makeClient(reply({ chunks: [concat(dataFrame({ offset: '1' }), endFrame())], state }));
+    await collect(client.streamRpc('/svc/List', {}));
+    assert.equal(state.cancelled, false);
+    assert.equal(state.released, true);
+  });
+
+  test('maps a mid-stream timeout to ConsoleStreamInterrupted', async () => {
+    const { client } = makeClient(reply({ chunks: [dataFrame({ offset: '1' })], failWith: timeoutError() }));
+    const seen = [];
+    await assert.rejects(
+      (async () => {
+        for await (const f of client.streamRpc('/svc/List', {})) seen.push(f);
+      })(),
+      (e) => e instanceof ConsoleStreamInterrupted && e.timeout === true,
+    );
+    assert.equal(seen.length, 1, 'frames before the failure are still delivered');
   });
 });
 

@@ -93,9 +93,23 @@ jobs:
           count=$(echo "$out" | node -e "
             let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{
               const t=JSON.parse(s.trim().split('\n')[0]).result.tools;
+              for (const x of t) if (x.annotations?.readOnlyHint !== true) throw new Error(x.name+' is not annotated read-only');
               console.log(t.length);
             });")
           [ "$count" = "7" ] || { echo "expected 7 tools, got $count"; exit 1; }
+
+      - name: --version matches package.json
+        run: |
+          v=$(node bin/redpanda-console-mcp.mjs --version)
+          want=$(node -p "require('./package.json').version")
+          [ "$v" = "$want" ] || { echo "--version printed '$v', package.json says '$want'"; exit 1; }
+
+      - name: rejects unknown tool arguments
+        run: |
+          out=$(echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"fetch_latest","arguments":{"topic":"t","partition":1}}}' \
+            | CONSOLE_BASE_URL=https://console.invalid node bin/redpanda-console-mcp.mjs)
+          echo "$out"
+          echo "$out" | grep -q 'unknown argument' || { echo "expected unknown-argument error: $out"; exit 1; }
 
       - name: an upstream failure is a tool error, not a crash
         run: |

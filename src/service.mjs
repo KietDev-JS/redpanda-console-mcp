@@ -9,6 +9,7 @@
 import { MAX_RESULTS_LIMIT, LIMITS } from './config.mjs';
 import { buildContainsFilter, encodeFilter } from './filters.mjs';
 import { normalizeMessage } from './models.mjs';
+import { ConsoleStreamInterrupted } from './console.mjs';
 
 const LIST_MESSAGES = '/redpanda.api.console.v1alpha1.ConsoleService/ListMessages';
 const KAFKA_INFO = '/redpanda.api.console.v1alpha1.ClusterStatusService/GetKafkaInfo';
@@ -152,16 +153,33 @@ export class ConsoleService {
 
     const messages = [];
     const stream = this.client.streamRpc(LIST_MESSAGES, request);
-    for await (const frame of stream) {
-      const data = frame.data;
-      if (data !== null && typeof data === 'object' && !Array.isArray(data)) {
-        messages.push(normalizeMessage(data));
-        if (messages.length >= maxResults) {
-          // Tell the generator to run its cleanup so the socket is released.
-          await stream.return?.();
-          break;
+    try {
+      for await (const frame of stream) {
+        const data = frame.data;
+        if (data !== null && typeof data === 'object' && !Array.isArray(data)) {
+          messages.push(normalizeMessage(data));
+          if (messages.length >= maxResults) {
+            // Tell the generator to run its cleanup so the socket is released.
+            await stream.return?.();
+            break;
+          }
         }
       }
+    } catch (e) {
+      // A live tail (start_offset -3) or a slow filtered scan routinely runs
+      // until the timeout. If messages already arrived, throwing would discard
+      // them; return them and say why the list is short.
+      if (e instanceof ConsoleStreamInterrupted && messages.length > 0) {
+        return {
+          messages,
+          incomplete: {
+            returned: messages.length,
+            requested: maxResults,
+            reason: e.message,
+          },
+        };
+      }
+      throw e;
     }
     return messages;
   }

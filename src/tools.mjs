@@ -73,6 +73,20 @@ const maxResultsSchema = (dflt) => ({
 
 const topicSchema = { type: 'string', description: 'Kafka topic name.' };
 
+/**
+ * MCP tool annotations. Every tool only reads: consuming through the Console
+ * uses no consumer group and commits no offsets, so nothing about the cluster
+ * changes. Clients use readOnlyHint to skip confirmation prompts.
+ * idempotentHint is false because "latest" and live-tail results change as
+ * messages are produced.
+ */
+const READ_ONLY = Object.freeze({
+  readOnlyHint: true,
+  destructiveHint: false,
+  idempotentHint: false,
+  openWorldHint: true,
+});
+
 export const TOOLS = [
   {
     name: 'list_topics',
@@ -95,11 +109,13 @@ export const TOOLS = [
       },
       additionalProperties: false,
     },
+    annotations: READ_ONLY,
   },
   {
     name: 'cluster_info',
     description: 'Get cluster health: status, version, broker and partition counts.',
     inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+    annotations: READ_ONLY,
   },
   {
     name: 'describe_topic',
@@ -110,6 +126,7 @@ export const TOOLS = [
       required: ['topic'],
       additionalProperties: false,
     },
+    annotations: READ_ONLY,
   },
   {
     name: 'fetch_latest',
@@ -124,6 +141,7 @@ export const TOOLS = [
       required: ['topic'],
       additionalProperties: false,
     },
+    annotations: READ_ONLY,
   },
   {
     name: 'fetch_by_offset',
@@ -142,6 +160,7 @@ export const TOOLS = [
       required: ['topic', 'offset'],
       additionalProperties: false,
     },
+    annotations: READ_ONLY,
   },
   {
     name: 'fetch_by_time',
@@ -161,6 +180,7 @@ export const TOOLS = [
       required: ['topic', 'timestamp_ms'],
       additionalProperties: false,
     },
+    annotations: READ_ONLY,
   },
   {
     name: 'search_messages',
@@ -195,6 +215,7 @@ export const TOOLS = [
       required: ['topic', 'text'],
       additionalProperties: false,
     },
+    annotations: READ_ONLY,
   },
 ];
 

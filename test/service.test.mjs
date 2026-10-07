@@ -10,7 +10,9 @@ import {
   concat,
   topicList,
   sentEnvelope,
+  timeoutError,
 } from '../test-utils/helpers.mjs';
+import { ConsoleStreamInterrupted } from '../src/console.mjs';
 
 /** A streaming response carrying `n` messages then a clean trailer. */
 function messages(n, make = (i) => ({ partitionId: i % 3, offset: String(i) })) {
@@ -245,6 +247,45 @@ describe('fetchMessages', () => {
     await assert.rejects(
       service.fetchMessages({ topic: '', startOffset: -2, maxResults: 5 }),
       /non-empty/,
+    );
+  });
+
+  test('keeps messages that arrived before a mid-stream timeout', async () => {
+    // The usual live-tail outcome: two messages, then the topic goes quiet
+    // until the request timeout fires.
+    const { service } = makeClient(
+      reply({
+        chunks: [concat(dataFrame({ offset: '7' }), dataFrame({ offset: '8' }))],
+        failWith: timeoutError(),
+      }),
+    );
+    const result = await service.fetchMessages({ topic: 't', startOffset: -3, maxResults: 10 });
+    assert.deepEqual(
+      result.messages.map((m) => m.offset),
+      [7, 8],
+    );
+    assert.equal(result.incomplete.returned, 2);
+    assert.equal(result.incomplete.requested, 10);
+    assert.match(result.incomplete.reason, /timed out/);
+  });
+
+  test('still fails when a timeout arrives before any message', async () => {
+    const { service } = makeClient(reply({ chunks: [], failWith: timeoutError() }));
+    await assert.rejects(
+      service.fetchMessages({ topic: 't', startOffset: -3, maxResults: 10 }),
+      (e) => e instanceof ConsoleStreamInterrupted,
+    );
+  });
+
+  test('does not swallow non-transport errors after partial results', async () => {
+    const { service } = makeClient(
+      reply({
+        chunks: [concat(dataFrame({ offset: '1' }), endFrame({ error: { code: 'internal', message: 'boom' } }))],
+      }),
+    );
+    await assert.rejects(
+      service.fetchMessages({ topic: 't', startOffset: -2, maxResults: 10 }),
+      /internal: boom/,
     );
   });
 });

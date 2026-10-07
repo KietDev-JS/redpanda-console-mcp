@@ -9,7 +9,17 @@ import {
   SERVER_INFO,
   MAX_OUT,
 } from '../src/server.mjs';
-import { makeClient, reply, dataFrame, endFrame, concat, topicList } from '../test-utils/helpers.mjs';
+import { readFileSync } from 'node:fs';
+import { TOOLS } from '../src/tools.mjs';
+import {
+  makeClient,
+  reply,
+  dataFrame,
+  endFrame,
+  concat,
+  topicList,
+  timeoutError,
+} from '../test-utils/helpers.mjs';
 
 function messages(n, pad = '') {
   const frames = Array.from({ length: n }, (_, i) =>
@@ -166,6 +176,80 @@ describe('tools/call', () => {
     assert.equal(out.length, 3);
     assert.equal(out[0].offset, 0);
   });
+
+  test('rejects unknown arguments instead of silently ignoring them', async () => {
+    const { service, calls } = makeClient(messages(1));
+    const sent = [];
+    await createServer(service, (m) => sent.push(m))({
+      id: 13,
+      method: 'tools/call',
+      params: { name: 'fetch_latest', arguments: { topic: 't', partition: 2 } },
+    });
+    assert.equal(sent[0].result.isError, true);
+    assert.match(sent[0].result.content[0].text, /unknown argument\(s\) for fetch_latest: partition/);
+    assert.match(sent[0].result.content[0].text, /Expected: topic, max_results, partition_id/);
+    assert.equal(calls.length, 0, 'a rejected call must not reach the network');
+  });
+
+  test('rejects non-object arguments', async () => {
+    for (const bad of [['t'], 'orders', 7]) {
+      const [res] = await exchange({}, {
+        id: 14,
+        method: 'tools/call',
+        params: { name: 'describe_topic', arguments: bad },
+      });
+      assert.equal(res.result.isError, true);
+      assert.match(res.result.content[0].text, /arguments must be a JSON object/);
+    }
+  });
+
+  test('does not resolve inherited properties as tool names', async () => {
+    const [res] = await exchange({}, {
+      id: 15,
+      method: 'tools/call',
+      params: { name: 'toString', arguments: {} },
+    });
+    assert.match(res.result.content[0].text, /Unknown tool: toString/);
+  });
+
+  test('a mid-stream timeout returns the messages received so far', async () => {
+    const [res] = await exchange(
+      reply({ chunks: [concat(dataFrame({ offset: '5' }))], failWith: timeoutError() }),
+      {
+        id: 16,
+        method: 'tools/call',
+        params: { name: 'search_messages', arguments: { topic: 't', text: 'x', start_offset: -3 } },
+      },
+    );
+    assert.equal(res.result.isError, undefined);
+    const out = payload(res.result);
+    assert.equal(out.messages[0].offset, 5);
+    assert.match(out.incomplete.reason, /timed out/);
+  });
+
+  test('a timeout with nothing received is a tool error, not "Unexpected error"', async () => {
+    const [res] = await exchange(reply({ chunks: [], failWith: timeoutError() }), {
+      id: 17,
+      method: 'tools/call',
+      params: { name: 'fetch_latest', arguments: { topic: 't' } },
+    });
+    assert.equal(res.result.isError, true);
+    assert.doesNotMatch(res.result.content[0].text, /Unexpected error/);
+    assert.match(res.result.content[0].text, /timed out after/);
+  });
+
+  test('every tool is annotated read-only and non-destructive', () => {
+    for (const t of TOOLS) {
+      assert.equal(t.annotations?.readOnlyHint, true, `${t.name} readOnlyHint`);
+      assert.equal(t.annotations?.destructiveHint, false, `${t.name} destructiveHint`);
+    }
+  });
+
+  test('serverInfo reports the package.json version', () => {
+    const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+    assert.equal(SERVER_INFO.version, pkg.version);
+    assert.equal(SERVER_INFO.name, pkg.name);
+  });
 });
 
 describe('serializeBounded', () => {
@@ -185,6 +269,15 @@ describe('serializeBounded', () => {
     assert.ok(parsed.truncated.returned < parsed.truncated.of);
     assert.equal(parsed.truncated.of, 500);
     assert.ok(Array.isArray(parsed.messages));
+  });
+
+  test('an oversized partial result sheds messages and keeps the incomplete marker', () => {
+    const msgs = Array.from({ length: 300 }, (_, i) => ({ i, pad: 'x'.repeat(200) }));
+    const text = serializeBounded({ messages: msgs, incomplete: { returned: 300, requested: 500, reason: 'r' } }, 5000);
+    const parsed = JSON.parse(text);
+    assert.ok(text.length <= 5000);
+    assert.equal(parsed.incomplete.reason, 'r');
+    assert.ok(parsed.truncated.returned < 300);
   });
 
   test('an oversized topic list sheds topics and stays valid JSON', () => {
@@ -245,6 +338,19 @@ describe('listen', () => {
     const lines = chunks.join('').trim().split('\n').map((l) => JSON.parse(l));
     assert.equal(lines[0].error.code, -32700);
     assert.equal(lines[1].id, 2, 'reader must survive a bad line');
+  });
+
+  test('stops writing after stdout errors (client went away) instead of crashing', () => {
+    const input = new PassThrough();
+    const output = new PassThrough();
+    const writes = [];
+    output.write = (s) => writes.push(s);
+    const { send } = listen(() => {}, { input, output });
+    send({ id: 1, result: {} });
+    output.emit('error', Object.assign(new Error('write EPIPE'), { code: 'EPIPE' }));
+    send({ id: 2, result: {} });
+    assert.equal(writes.length, 1);
+    input.end();
   });
 
   test('blank lines are ignored', async () => {

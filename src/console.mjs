@@ -44,6 +44,22 @@ export class ConsoleRPCError extends ConsoleError {
   }
 }
 
+/**
+ * The connection failed or timed out after the response had started.
+ *
+ * Raised by the stream reader so the service layer can distinguish a stream
+ * that produced nothing from one that delivered some messages and then
+ * stopped. The latter is the normal outcome of tailing a quiet topic until
+ * the timeout.
+ */
+export class ConsoleStreamInterrupted extends ConsoleError {
+  constructor(message, { timeout = false } = {}) {
+    super(message);
+    this.name = 'ConsoleStreamInterrupted';
+    this.timeout = timeout;
+  }
+}
+
 /** The response did not conform to the expected wire format. */
 export class ConsoleProtocolError extends ConsoleError {
   constructor(message) {
@@ -126,14 +142,28 @@ async function* streamBytes(body) {
     return;
   }
   const reader = body.getReader();
+  let finished = false;
   try {
     for (;;) {
       const { done, value } = await reader.read();
-      if (done) break;
+      if (done) {
+        finished = true;
+        break;
+      }
       if (value) yield toBytes(value);
     }
   } finally {
-    // Releasing lets the connection be torn down when a caller breaks early.
+    // When the caller stops early the body is still open. Releasing the lock
+    // alone leaves the socket held until garbage collection; cancelling tells
+    // fetch to abort the transfer and free the connection now. That matters
+    // for live tails, which otherwise keep streaming until the timeout.
+    if (!finished) {
+      try {
+        await reader.cancel();
+      } catch {
+        /* stream already errored or closed */
+      }
+    }
     try {
       reader.releaseLock();
     } catch {
@@ -182,7 +212,7 @@ export class ConsoleClient {
         signal: AbortSignal.timeout(this.config.timeoutMs),
       });
     } catch (e) {
-      if (e?.name === 'TimeoutError' || e?.name === 'AbortError') {
+      if (isTimeout(e)) {
         throw new ConsoleError(
           `request to Redpanda Console timed out after ${this.config.timeoutMs}ms`,
         );
@@ -193,13 +223,41 @@ export class ConsoleClient {
     }
   }
 
+  /**
+   * Read a whole response body as text.
+   *
+   * The timeout signal is still armed while the body downloads, so this can
+   * fail too; map it to ConsoleError instead of letting a DOMException leak
+   * out as an "Unexpected error".
+   */
+  async readText(res) {
+    try {
+      return await res.text();
+    } catch (e) {
+      throw this.interrupted(e);
+    }
+  }
+
+  interrupted(e) {
+    if (e instanceof ConsoleError) return e;
+    if (isTimeout(e)) {
+      return new ConsoleStreamInterrupted(
+        `Redpanda Console response timed out after ${this.config.timeoutMs}ms`,
+        { timeout: true },
+      );
+    }
+    return new ConsoleStreamInterrupted(
+      `connection to Redpanda Console was interrupted while reading the response: ${e?.message || e}`,
+    );
+  }
+
   // -- REST -----------------------------------------------------------------
 
   /** GET a dataplane REST endpoint and decode the JSON body. */
   async getJson(path, params) {
     const url = this.url(path, params);
     const res = await this.send(url, { method: 'GET', headers: this.headers });
-    const text = await res.text();
+    const text = await this.readText(res);
     if (res.status >= 400) throw new ConsoleHTTPError(res.status, String(url), text);
     return decodeJson(text, url, res);
   }
@@ -219,7 +277,7 @@ export class ConsoleClient {
       headers: { ...this.headers, 'Content-Type': 'application/json' },
       body: JSON.stringify(message || {}),
     });
-    const text = await res.text();
+    const text = await this.readText(res);
     if (res.status >= 400) throw new ConsoleHTTPError(res.status, String(url), text);
     const payload = decodeJson(text, url, res);
     if (payload !== null && typeof payload === 'object' && !Array.isArray(payload)) {
@@ -250,10 +308,10 @@ export class ConsoleClient {
     });
 
     if (res.status >= 400) {
-      throw new ConsoleHTTPError(res.status, String(url), await res.text());
+      throw new ConsoleHTTPError(res.status, String(url), await this.readText(res));
     }
 
-    for await (const { flags, payload } of iterEnvelopes(streamBytes(res.body))) {
+    for await (const { flags, payload } of iterEnvelopes(this.guardedBytes(res.body))) {
       if (flags & FLAG_COMPRESSED) {
         throw new ConsoleProtocolError(
           'Console returned a compressed Connect frame, which is not supported. ' +
@@ -281,6 +339,19 @@ export class ConsoleClient {
       yield frame;
     }
   }
+
+  /** streamBytes, with transport failures mapped to ConsoleStreamInterrupted. */
+  async *guardedBytes(body) {
+    try {
+      yield* streamBytes(body);
+    } catch (e) {
+      throw this.interrupted(e);
+    }
+  }
+}
+
+function isTimeout(e) {
+  return e?.name === 'TimeoutError' || e?.name === 'AbortError';
 }
 
 function decodeJson(text, url, res) {
