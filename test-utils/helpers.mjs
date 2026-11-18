@@ -7,6 +7,8 @@ import { createHandlers } from '../src/tools.mjs';
 
 export const TEST_ENV = {
   CONSOLE_BASE_URL: 'https://console.example.com',
+  // Retries have their own tests; elsewhere one response means one request.
+  CONSOLE_MAX_RETRIES: '0',
 };
 
 /**
@@ -106,8 +108,10 @@ export function timeoutError() {
  * @param {object|((url: URL, init: object) => object)} responder
  *   A plain JSON body, a `reply(...)` response, an Error to throw, or a
  *   function returning any of those.
+ * @param {Record<string, string>} [env]
+ * @param {{ sleep?: (ms: number, signal: AbortSignal) => Promise<void> }} [deps]
  */
-export function makeClient(responder, env = TEST_ENV) {
+export function makeClient(responder, env = TEST_ENV, deps = {}) {
   const calls = [];
   const fetchImpl = async (url, init) => {
     calls.push({
@@ -135,7 +139,7 @@ export function makeClient(responder, env = TEST_ENV) {
     };
   };
 
-  const client = new ConsoleClient(loadConfig(env), { fetch: fetchImpl });
+  const client = new ConsoleClient(loadConfig(env), { fetch: fetchImpl, ...deps });
   const service = new ConsoleService(client);
   return { client, service, calls, handlers: createHandlers(service) };
 }

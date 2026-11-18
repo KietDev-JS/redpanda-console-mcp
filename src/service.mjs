@@ -9,13 +9,16 @@
 import { MAX_RESULTS_LIMIT, LIMITS } from './config.mjs';
 import { buildContainsFilter, encodeFilter } from './filters.mjs';
 import { normalizeMessage } from './models.mjs';
-import { ConsoleStreamInterrupted } from './console.mjs';
+import { ConsoleRPCError, ConsoleStreamInterrupted } from './console.mjs';
 
 const LIST_MESSAGES = '/redpanda.api.console.v1alpha1.ConsoleService/ListMessages';
 const KAFKA_INFO = '/redpanda.api.console.v1alpha1.ClusterStatusService/GetKafkaInfo';
 const TOPICS = '/v1/topics';
 
 export const ALL_PARTITIONS = -1;
+
+/** Kafka's own limit on topic name length. */
+const MAX_TOPIC_LENGTH = 249;
 
 /** Sentinel values accepted by the Console's `startOffset` field. */
 export const StartOffset = Object.freeze({
@@ -70,6 +73,16 @@ function requireTopic(topic) {
   if (typeof topic !== 'string' || !topic.trim()) {
     throw new ValidationError('topic must be a non-empty topic name.');
   }
+  // encodeURIComponent leaves dots alone, so URL parsing would collapse these
+  // segments and send the request to a different endpoint. Kafka forbids both.
+  if (topic === '.' || topic === '..') {
+    throw new ValidationError(`topic must not be "${topic}". Use list_topics to find topic names.`);
+  }
+  if (topic.length > MAX_TOPIC_LENGTH) {
+    throw new ValidationError(
+      `topic must not exceed ${MAX_TOPIC_LENGTH} characters (got ${topic.length}).`,
+    );
+  }
   return topic;
 }
 
@@ -80,8 +93,18 @@ export class ConsoleService {
     this.client = client;
   }
 
+  /** Remove credentials from diagnostic text before it reaches the model. */
+  scrub(text) {
+    return this.client.scrub(text);
+  }
+
   /** List topics, optionally filtered by a substring of the name. */
-  async listTopics({ nameContains = '', pageSize = LIMITS.DEFAULT_PAGE_SIZE } = {}) {
+  async listTopics({
+    nameContains = '',
+    pageSize = LIMITS.DEFAULT_PAGE_SIZE,
+    pageToken = '',
+    signal,
+  } = {}) {
     requireInteger(pageSize, 'page_size');
     if (pageSize < 1) {
       throw new ValidationError(`page_size must be at least 1 (got ${pageSize}).`);
@@ -94,28 +117,32 @@ export class ConsoleService {
 
     const params = { page_size: pageSize };
     if (nameContains) params['filter.name_contains'] = nameContains;
+    if (pageToken) params.page_token = pageToken;
 
-    const payload = await this.client.getJson(TOPICS, params);
+    const payload = await this.client.getJson(TOPICS, params, { signal });
     const isObject = payload !== null && typeof payload === 'object' && !Array.isArray(payload);
     const topics = isObject && Array.isArray(payload.topics) ? payload.topics : [];
     return {
       topics,
       count: topics.length,
-      next_page_token: isObject ? (payload.next_page_token ?? null) : null,
+      // proto3 JSON renders "no more pages" as an empty string.
+      next_page_token: isObject ? payload.next_page_token || payload.nextPageToken || null : null,
     };
   }
 
   /** Return Kafka cluster health, broker counts and version. */
-  async clusterInfo() {
-    return this.client.unaryRpc(KAFKA_INFO, {});
+  async clusterInfo({ signal } = {}) {
+    return this.client.unaryRpc(KAFKA_INFO, {}, { signal });
   }
 
   /** Return the effective configuration of a single topic. */
-  async describeTopic(topic) {
+  async describeTopic(topic, { signal } = {}) {
     requireTopic(topic);
     // Percent-encode the path segment so a topic name containing '/' or '%'
     // cannot break out of the URL path.
-    return this.client.getJson(`/v1/topics/${encodeURIComponent(topic)}/configurations`);
+    return this.client.getJson(`/v1/topics/${encodeURIComponent(topic)}/configurations`, undefined, {
+      signal,
+    });
   }
 
   /**
@@ -132,6 +159,7 @@ export class ConsoleService {
     partitionId = ALL_PARTITIONS,
     startTimestampMs = null,
     filterCode = null,
+    signal,
   }) {
     requireTopic(topic);
     validateMaxResults(maxResults);
@@ -152,9 +180,18 @@ export class ConsoleService {
     }
 
     const messages = [];
-    const stream = this.client.streamRpc(LIST_MESSAGES, request);
+    const stream = this.client.streamRpc(LIST_MESSAGES, request, { signal });
     try {
       for await (const frame of stream) {
+        // ListMessages reports failures such as a rejected filter in a normal
+        // frame. Ignoring it would make the failure look like "no matches".
+        const failure = frame.error;
+        if (failure !== null && typeof failure === 'object' && !Array.isArray(failure)) {
+          throw new ConsoleRPCError(
+            failure.code ?? null,
+            failure.message || 'Redpanda Console reported an error while reading messages.',
+          );
+        }
         const data = frame.data;
         if (data !== null && typeof data === 'object' && !Array.isArray(data)) {
           messages.push(normalizeMessage(data));
@@ -175,7 +212,7 @@ export class ConsoleService {
           incomplete: {
             returned: messages.length,
             requested: maxResults,
-            reason: e.message,
+            reason: this.scrub(e.message),
           },
         };
       }
@@ -184,12 +221,18 @@ export class ConsoleService {
     return messages;
   }
 
-  async fetchLatest({ topic, maxResults = LIMITS.DEFAULT_MAX_RESULTS, partitionId = ALL_PARTITIONS }) {
+  async fetchLatest({
+    topic,
+    maxResults = LIMITS.DEFAULT_MAX_RESULTS,
+    partitionId = ALL_PARTITIONS,
+    signal,
+  }) {
     return this.fetchMessages({
       topic,
       startOffset: StartOffset.RECENT,
       maxResults,
       partitionId,
+      signal,
     });
   }
 
@@ -198,6 +241,7 @@ export class ConsoleService {
     offset,
     maxResults = LIMITS.DEFAULT_MAX_RESULTS,
     partitionId = ALL_PARTITIONS,
+    signal,
   }) {
     requireInteger(offset, 'offset');
     if (offset < 0) {
@@ -207,7 +251,7 @@ export class ConsoleService {
           "which exposes the 'oldest', 'newest' and 'recent' start positions.",
       );
     }
-    return this.fetchMessages({ topic, startOffset: offset, maxResults, partitionId });
+    return this.fetchMessages({ topic, startOffset: offset, maxResults, partitionId, signal });
   }
 
   async fetchByTime({
@@ -215,6 +259,7 @@ export class ConsoleService {
     timestampMs,
     maxResults = LIMITS.DEFAULT_SEARCH_RESULTS,
     partitionId = ALL_PARTITIONS,
+    signal,
   }) {
     requireInteger(timestampMs, 'timestamp_ms');
     if (timestampMs < 0) {
@@ -228,6 +273,7 @@ export class ConsoleService {
       startTimestampMs: timestampMs,
       maxResults,
       partitionId,
+      signal,
     });
   }
 
@@ -245,6 +291,7 @@ export class ConsoleService {
     startTimestampMs = null,
     partitionId = ALL_PARTITIONS,
     caseSensitive = true,
+    signal,
   }) {
     let effectiveOffset = startOffset;
     if (startTimestampMs !== null && startTimestampMs !== undefined) {
@@ -255,6 +302,10 @@ export class ConsoleService {
         );
       }
       effectiveOffset = StartOffset.TIMESTAMP;
+    } else if (startOffset === StartOffset.TIMESTAMP) {
+      throw new ValidationError(
+        'start_offset -4 means "start from a timestamp", so start_timestamp_ms is required.',
+      );
     }
 
     let filterCode;
@@ -272,6 +323,7 @@ export class ConsoleService {
       maxResults,
       partitionId,
       filterCode,
+      signal,
     });
   }
 }

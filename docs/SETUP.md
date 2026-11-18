@@ -104,7 +104,7 @@ as the Claude Desktop config.
 `npx -y redpanda-console-mcp` resolves the latest release. To pin:
 
 ```json
-{ "args": ["-y", "redpanda-console-mcp@1.0.0"] }
+{ "args": ["-y", "redpanda-console-mcp@1.1.0"] }
 ```
 
 ## Troubleshooting
@@ -126,6 +126,18 @@ cannot authenticate to it.
 Lower `max_results`, or narrow the scan with `start_offset` / `start_timestamp_ms`.
 Searching from the oldest offset on a high-volume topic means the Console scans
 the whole topic. Raise `CONSOLE_TIMEOUT` if you genuinely need long scans.
+
+**Calls fail with HTTP 429, 502, 503 or 504.**
+These are retried automatically, twice by default, within `CONSOLE_TIMEOUT`. Set
+`CONSOLE_MAX_RETRIES` from 0 to 5 to change that.
+
+**"Expected a Connect stream" or "exceeds the byte limit".**
+Something other than the Console answered, usually an SSO login page or a reverse
+proxy. Check `CONSOLE_BASE_URL` with the `curl` command at the top of this guide.
+
+**A result contains `truncated`.**
+It exceeded the 200 KB result limit. Continue with `fetch_by_offset` from each
+`truncated.resume_from` entry, or lower `max_results`.
 
 **"max_results must not exceed 500".**
 That is the Console's own streaming limit, not an arbitrary one. Page with

@@ -140,5 +140,7 @@ export function normalizeMessage(data) {
     value_size_bytes: value.sizeBytes,
     compression: source.compression ?? null,
     value_is_binary: value.binary,
+    // Only present when true, so text-keyed messages keep their existing shape.
+    ...(key.binary ? { key_is_binary: true } : {}),
   };
 }

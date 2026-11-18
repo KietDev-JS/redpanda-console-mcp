@@ -25,8 +25,9 @@ export function intArg(value, name, { fallback, min, max } = {}) {
     if (fallback === undefined) throw new ToolError(`${name} is required.`);
     return fallback;
   }
-  const n = typeof value === 'string' && value.trim() !== '' ? Number(value) : value;
-  if (typeof n !== 'number' || !Number.isFinite(n) || !Number.isInteger(n)) {
+  const n = typeof value === 'string' && /^\s*[+-]?\d+\s*$/.test(value) ? Number(value) : value;
+  // Beyond the safe range a number silently rounds to a different offset.
+  if (typeof n !== 'number' || !Number.isSafeInteger(n)) {
     throw new ToolError(`${name} must be an integer (got ${JSON.stringify(value)}).`);
   }
   if (min !== undefined && n < min) {
@@ -90,7 +91,10 @@ const READ_ONLY = Object.freeze({
 export const TOOLS = [
   {
     name: 'list_topics',
-    description: 'List Kafka topics with partition count and replication factor.',
+    description:
+      'List Kafka topics with partition count and replication factor. Returns ' +
+      '{ topics, count, next_page_token }. When next_page_token is not null, pass it ' +
+      'back as page_token to get the next page.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -106,6 +110,10 @@ export const TOOLS = [
           default: LIMITS.DEFAULT_PAGE_SIZE,
           description: 'Maximum topics to return.',
         },
+        page_token: {
+          type: 'string',
+          description: 'next_page_token from the previous list_topics result.',
+        },
       },
       additionalProperties: false,
     },
@@ -119,7 +127,9 @@ export const TOOLS = [
   },
   {
     name: 'describe_topic',
-    description: 'Get the effective configuration of a topic.',
+    description:
+      'Get the effective configuration of a topic, such as retention and cleanup policy. ' +
+      'Use list_topics to find topic names.',
     inputSchema: {
       type: 'object',
       properties: { topic: topicSchema },
@@ -130,7 +140,11 @@ export const TOOLS = [
   },
   {
     name: 'fetch_latest',
-    description: 'Fetch the most recent messages from a topic.',
+    description:
+      'Fetch the most recent messages from a topic. Returns an array of messages with ' +
+      'partition, offset, timestamp, key, value and headers. If the stream stops early ' +
+      'the result is { messages, incomplete }; if it is too large it includes truncated, ' +
+      'with resume_from offsets for fetch_by_offset.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -164,7 +178,9 @@ export const TOOLS = [
   },
   {
     name: 'fetch_by_time',
-    description: 'Fetch messages from the first offset at or after a timestamp.',
+    description:
+      'Fetch messages from the first offset at or after a timestamp, reading forwards. ' +
+      'Returns the same shape as fetch_latest.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -189,7 +205,8 @@ export const TOOLS = [
       "server-side in the Console's sandboxed JavaScript interpreter, so only " +
       'matching messages are transferred. Scanning starts from the oldest message ' +
       'by default; narrow the range with start_offset or start_timestamp_ms on ' +
-      'high-volume topics.',
+      'high-volume topics. Returns the same shape as fetch_latest; an empty array means ' +
+      'nothing matched in the scanned range.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -202,14 +219,19 @@ export const TOOLS = [
           default: StartOffset.OLDEST,
           description:
             'Where to start scanning: -1 recent, -2 oldest (default), -3 newest/live, ' +
-            'or an explicit offset.',
+            '-4 from start_timestamp_ms, or an explicit offset.',
         },
         start_timestamp_ms: {
           type: 'integer',
           minimum: 0,
-          description: 'Scan from this time instead of an offset.',
+          description:
+            'Scan from this Unix epoch time in milliseconds. Takes precedence over start_offset.',
         },
-        case_sensitive: { type: 'boolean', default: true },
+        case_sensitive: {
+          type: 'boolean',
+          default: true,
+          description: 'Set false to ignore case when matching.',
+        },
         partition_id: partitionSchema,
       },
       required: ['topic', 'text'],
@@ -233,9 +255,9 @@ export function createHandlers(service) {
 
   // Every handler is async so that argument validation rejects rather than
   // throwing synchronously. A caller awaiting the result then sees one
-  // failure mode instead of two.
+  // failure mode instead of two. `signal` cancels the upstream request.
   return {
-    list_topics: async (a) =>
+    list_topics: async (a, { signal } = {}) =>
       service.listTopics({
         nameContains: stringArg(a.name_contains, 'name_contains', { fallback: '' }),
         pageSize: intArg(a.page_size, 'page_size', {
@@ -243,37 +265,43 @@ export function createHandlers(service) {
           min: 1,
           max: LIMITS.MAX_PAGE_SIZE,
         }),
+        pageToken: stringArg(a.page_token, 'page_token', { fallback: '' }),
+        signal,
       }),
 
-    cluster_info: async () => service.clusterInfo(),
+    cluster_info: async (_a, { signal } = {}) => service.clusterInfo({ signal }),
 
-    describe_topic: async (a) => service.describeTopic(topic(a)),
+    describe_topic: async (a, { signal } = {}) => service.describeTopic(topic(a), { signal }),
 
-    fetch_latest: async (a) =>
+    fetch_latest: async (a, { signal } = {}) =>
       service.fetchLatest({
         topic: topic(a),
         maxResults: maxResults(a, LIMITS.DEFAULT_MAX_RESULTS),
         partitionId: partition(a),
+        signal,
       }),
 
-    fetch_by_offset: async (a) =>
+    fetch_by_offset: async (a, { signal } = {}) =>
       service.fetchByOffset({
         topic: topic(a),
         offset: intArg(a.offset, 'offset', { min: 0 }),
         maxResults: maxResults(a, LIMITS.DEFAULT_MAX_RESULTS),
         partitionId: partition(a),
+        signal,
       }),
 
-    fetch_by_time: async (a) =>
+    fetch_by_time: async (a, { signal } = {}) =>
       service.fetchByTime({
         topic: topic(a),
         timestampMs: intArg(a.timestamp_ms, 'timestamp_ms', { min: 0 }),
         maxResults: maxResults(a, LIMITS.DEFAULT_SEARCH_RESULTS),
         partitionId: partition(a),
+        signal,
       }),
 
-    search_messages: async (a) =>
+    search_messages: async (a, { signal } = {}) =>
       service.searchMessages({
+        signal,
         topic: topic(a),
         text: stringArg(a.text, 'text', { required: true }),
         maxResults: maxResults(a, LIMITS.DEFAULT_SEARCH_RESULTS),

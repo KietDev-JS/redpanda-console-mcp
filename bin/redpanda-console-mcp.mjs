@@ -18,6 +18,7 @@ function main(argv = process.argv.slice(2)) {
         '  CONSOLE_BASE_URL    required, e.g. https://console.example.com\n' +
         '  CONSOLE_API_KEY     optional bearer token\n' +
         '  CONSOLE_TIMEOUT     request timeout in seconds (default 60)\n' +
+        '  CONSOLE_MAX_RETRIES retries for transient failures, 0-5 (default 2)\n' +
         '  CONSOLE_VERIFY_TLS  set false to skip TLS verification (insecure)\n',
     );
     return;
@@ -33,6 +34,13 @@ function main(argv = process.argv.slice(2)) {
       return;
     }
     throw e;
+  }
+
+  if (config.urlCredentialsIgnored) {
+    process.stderr.write(
+      `${SERVER_INFO.name}: WARNING - credentials in CONSOLE_BASE_URL are ignored; ` +
+        'use CONSOLE_API_KEY instead.\n',
+    );
   }
 
   if (!config.verifyTls) {

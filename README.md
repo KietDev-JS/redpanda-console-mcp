@@ -23,7 +23,7 @@ interpreter, so only matching messages cross the network.
 
 | Tool | Purpose |
 |---|---|
-| `list_topics` | List topics with partition count and replication factor |
+| `list_topics` | List topics with partition count and replication factor. Pass `next_page_token` back as `page_token` for the next page |
 | `cluster_info` | Cluster health: status, version, broker and partition counts |
 | `describe_topic` | Effective configuration of one topic |
 | `fetch_latest` | Most recent messages from a topic |
@@ -50,7 +50,8 @@ npm install -g redpanda-console-mcp
 |---|---|---|---|
 | `CONSOLE_BASE_URL` | yes | — | Console address, e.g. `https://console.example.com` |
 | `CONSOLE_API_KEY` | no | *(none)* | Sent as `Authorization: Bearer <key>` |
-| `CONSOLE_TIMEOUT` | no | `60` | Request timeout in seconds |
+| `CONSOLE_TIMEOUT` | no | `60` | Request timeout in seconds, covering all retries |
+| `CONSOLE_MAX_RETRIES` | no | `2` | Retries for network failures and HTTP 429, 502, 503 and 504 (0-5) |
 | `CONSOLE_VERIFY_TLS` | no | `true` | Set `false` to skip TLS verification |
 
 There is deliberately no default base URL: pointing a Kafka client at a guessed
@@ -98,12 +99,19 @@ up a client, plus troubleshooting.
 - `page_size` for `list_topics` is capped at 1000.
 - Search text is capped at 4096 characters.
 - A single tool result is capped at ~200 KB. Oversized results shed whole
-  messages and report the truncation rather than emitting broken JSON.
-- If the stream times out or drops **after** some messages have arrived, those
-  messages are returned as `{ "messages": [...], "incomplete": { returned,
-  requested, reason } }`. They are not thrown away. This is the normal result
-  of a live tail (`start_offset: -3`) on a quiet topic. A timeout before any
-  message arrives is still an error.
+  messages and return `truncated`, whose `resume_from` lists the partition and
+  offset to continue from with `fetch_by_offset`. If the first message alone is
+  too large, its value is cut and flagged with `value_truncated` and
+  `value_total_chars`.
+- If the stream times out, drops or closes early **after** some messages have
+  arrived, those messages are returned as `{ "messages": [...], "incomplete": {
+  returned, requested, reason } }`. They are not thrown away. This is the normal
+  result of a live tail (`start_offset: -3`) on a quiet topic. A timeout before
+  any message arrives is still an error.
+- Transient failures are retried with backoff, honouring `Retry-After` up to
+  5 seconds. A stream that has already started is never restarted.
+- A client can stop a running call with `notifications/cancelled`, which also
+  closes the upstream request.
 
 ## Notes on behaviour
 
@@ -118,7 +126,8 @@ A few Console details this server absorbs so the model does not have to:
   Streaming methods use 5-byte length-prefixed envelopes, which routinely
   straddle TCP chunk boundaries.
 - **Binary payloads are not mangled.** Values that are not valid UTF-8 are
-  returned as base64 and flagged with `value_is_binary`.
+  returned as base64 and flagged with `value_is_binary`. Binary keys get
+  `key_is_binary: true`.
 - **`partition_id: -1` reads every partition**, so an offset is applied per
   partition. Pass an explicit partition to page deterministically.
 
@@ -130,13 +139,19 @@ It cannot, however, reduce the privileges of the credential you give it — use 
 read-only Console user. Search terms are embedded as JSON string literals, so
 they cannot escape into executable code in the Console's interpreter.
 
+Error text is scrubbed of the API key, bearer and basic tokens, URL credentials
+and common `password=` style values before it reaches the model. Kafka message
+content is returned as stored, so anyone using this server can read whatever the
+credential can read. Credentials embedded in `CONSOLE_BASE_URL` are ignored with
+a warning; use `CONSOLE_API_KEY`.
+
 `CONSOLE_VERIFY_TLS=false` disables certificate verification for the whole
 process and prints a warning. Use it only against a host you control.
 
 ## Development
 
 ```bash
-npm test                 # 229 tests, no network access
+npm test                 # offline; end-to-end tests use a loopback mock Console
 npm run test:coverage
 ```
 
